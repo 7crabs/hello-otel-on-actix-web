@@ -1,28 +1,92 @@
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpServer};
+use opentelemetry::trace::TracerProvider;
+use opentelemetry::{global, KeyValue};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{propagation::TraceContextPropagator, Resource};
+use opentelemetry_semantic_conventions::resource;
+use std::io;
+use std::sync::LazyLock;
+use std::time::Duration;
+use tracing::{info, warn};
+use tracing_actix_web::TracingLogger;
+use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
+use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
 
-#[get("/")]
-async fn hello() -> impl Responder {
-    HttpResponse::Ok().body("Hello world!")
+const APP_NAME: &str = "tracing-actix-web-demo";
+
+static RESOURCE: LazyLock<Resource> = LazyLock::new(|| {
+    Resource::builder()
+        .with_attribute(KeyValue::new(resource::SERVICE_NAME, APP_NAME))
+        .build()
+});
+
+#[tracing::instrument]
+async fn goodby() -> &'static str {
+    warn!("enter goodby");
+    "goodby!"
 }
 
-#[post("/echo")]
-async fn echo(req_body: String) -> impl Responder {
-    HttpResponse::Ok().body(req_body)
+#[tracing::instrument]
+async fn hello() -> String {
+    info!("enter hello");
+    let mut result = "Hello ".to_string();
+    result.push_str(goodby().await);
+    result
 }
 
-async fn manual_hello() -> impl Responder {
-    HttpResponse::Ok().body("Hey there!")
+fn init_telemetry() -> opentelemetry_sdk::trace::SdkTracerProvider {
+    // Start a new otlp trace pipeline.
+    // Spans are exported in batch - recommended setup for a production application.
+    global::set_text_map_propagator(TraceContextPropagator::new());
+    let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint("http://localhost:4317")
+        .build()
+        .expect("Failed to build the span exporter");
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(otlp_exporter)
+        .with_resource(RESOURCE.clone())
+        .build();
+    let tracer = provider.tracer(APP_NAME);
+
+    // Filter based on level - trace, debug, info, warn, error
+    // Tunable via `RUST_LOG` env variable
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info"));
+    // Create a `tracing` layer using the otlp tracer
+    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+    // Create a `tracing` layer to emit spans as structured logs to stdout
+    let formatting_layer = BunyanFormattingLayer::new(APP_NAME.into(), std::io::stdout);
+    // Combined them all together in a `tracing` subscriber
+    let subscriber = Registry::default()
+        .with(env_filter)
+        .with(telemetry)
+        .with(JsonStorageLayer)
+        .with(formatting_layer);
+
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Failed to install `tracing` subscriber.");
+
+    provider
 }
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    HttpServer::new(|| {
+async fn main() -> io::Result<()> {
+    let provider = init_telemetry();
+
+    HttpServer::new(move || {
         App::new()
-            .service(hello)
-            .service(echo)
-            .route("/hey", web::get().to(manual_hello))
+            .wrap(TracingLogger::default())
+            .service(web::resource("/hello").to(hello))
     })
-    .bind(("127.0.0.1", 8080))?
+    .client_request_timeout(Duration::from_secs(1))
+    .bind("127.0.0.1:8080")?
     .run()
-    .await
+    .await?;
+
+    // Ensure all spans have been shipped to Jaeger.
+    provider
+        .shutdown()
+        .expect("Failed to close tracer provider");
+
+    Ok(())
 }
