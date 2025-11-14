@@ -71,6 +71,7 @@ fn init_telemetry() -> opentelemetry_sdk::trace::SdkTracerProvider {
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
+    println!("hello, world!");
     let provider = init_telemetry();
 
     HttpServer::new(move || {
